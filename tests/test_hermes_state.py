@@ -934,6 +934,27 @@ class TestFTS5Search:
         assert isinstance(results2, list)
         assert len(results2) >= 1
 
+    def test_search_colon_query_still_finds_content(self, db):
+        """Queries containing ':' must not silently return empty.
+
+        ':' is FTS5's column-filter operator. With a single-column FTS table an
+        unquoted query like 'TODO: fix' parses as 'column:term', raises
+        "no such column: TODO", and the swallowed error turns into zero results
+        even though the content is present. Regression for that silent-empty bug.
+        """
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="user", content="TODO fix the deployment script")
+
+        # Control: the same content is found without the colon.
+        assert len(db.search_messages("deployment")) >= 1
+
+        # The colon query must find the message, not silently return [].
+        results = db.search_messages("TODO: fix")
+        assert isinstance(results, list)
+        assert len(results) >= 1
+        assert any("deployment" in (r.get("snippet") or r.get("content", "")).lower()
+                   for r in results)
+
     def test_search_quoted_phrase_preserved(self, db):
         """User-provided quoted phrases should be preserved for exact matching."""
         db.create_session(session_id="s1", source="cli")
@@ -963,6 +984,10 @@ class TestFTS5Search:
         assert s('***') == ''
         # Valid prefix kept
         assert s('deploy*') == 'deploy*'
+        # Colon (FTS5 column-filter operator) stripped, both terms preserved
+        assert ':' not in s('TODO: fix')
+        assert s('TODO: fix').split() == ['TODO', 'fix']
+        assert ':' not in s('error:timeout')
 
     def test_sanitize_fts5_preserves_quoted_phrases(self):
         """Properly paired double-quoted phrases should be preserved."""
@@ -2715,6 +2740,44 @@ class TestListSessionsRich:
         sessions = db.list_sessions_rich()
         ids = [s["id"] for s in sessions]
         assert "branch" in ids, "Branch session should be visible in default list"
+
+    def test_branch_session_visible_after_parent_reopen_and_reend(self, db):
+        """Branch sessions stay visible after the parent is reopened and re-ended.
+
+        Regression for issue #20856: /branch (aka /fork) sessions vanished from
+        /resume and /sessions once the parent was reopened (e.g. resumed) and
+        re-ended with a different end_reason — tui_shutdown overwriting
+        'branched' — which broke the legacy end_reason heuristic. The stable
+        _branched_from marker in model_config keeps them visible.
+        """
+        import json as _json
+
+        db.create_session("parent", "cli")
+        db.end_session("parent", "branched")
+        db.create_session(
+            "branch",
+            "cli",
+            model_config={"_branched_from": "parent"},
+            parent_session_id="parent",
+        )
+        db.append_message("branch", "user", "Exploring the alternative approach")
+
+        # Marker is persisted at creation time.
+        branch_row = db.get_session("branch")
+        cfg = _json.loads(branch_row["model_config"]) if branch_row["model_config"] else {}
+        assert cfg.get("_branched_from") == "parent"
+
+        # Visible immediately after branching.
+        assert "branch" in [s["id"] for s in db.list_sessions_rich()]
+
+        # Parent reopened + re-ended with a different reason (the bug trigger).
+        db.reopen_session("parent")
+        db.end_session("parent", "tui_shutdown")
+
+        # Branch must STILL be visible — the marker survives the parent's
+        # end_reason churn, unlike the legacy 'branched' heuristic.
+        ids = [s["id"] for s in db.list_sessions_rich()]
+        assert "branch" in ids, "Branch should stay visible after parent re-end"
 
     def test_subagent_session_still_hidden(self, db):
         """Sub-agent children (parent NOT ended with 'branched') remain hidden."""
